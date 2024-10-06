@@ -1,5 +1,4 @@
----
-
+# **Gemstone** - Predictive Modeling with Shiny
 
 **Gemstone** (Good Enough Model, SomeTimes, Often, NEver) is a Shiny-based web application designed for predictive modeling on biological assay data using machine learning algorithms. This app allows users to train models, save and retrieve models from a database, and test new compound predictions.
 
