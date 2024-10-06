@@ -2,6 +2,47 @@ options(shiny.maxRequestSize=500*1024^2)
 options(java.parameters = c("-XX:+UseConcMarkSweepGC", "-Xmx12288m"))
 library(shiny)
 library(tidyverse)
+library(future)
+library(DBI)
+library(RSQLite)
+library(future)
+library(promises)
+
+# Create a SQLite database connection
+con <- dbConnect(RSQLite::SQLite(), "models.db")
+
+## Create a table to store models if it doesn't exist
+dbExecute(con, "CREATE TABLE IF NOT EXISTS models (aid INTEGER PRIMARY KEY, model BLOB)")
+
+# Function to save the model to the database
+save_model_to_db <- function(model, aid) {
+  # Serialize the model into a raw vector
+  serialized_model <- serialize(model, connection = NULL)
+  
+  # Convert the serialized model to a raw vector before inserting it
+  dbExecute(con, "INSERT OR REPLACE INTO models (aid, model) VALUES (?, ?)",
+            params = list(aid, list(serialized_model)))
+}
+
+
+# Function to load the model from the database
+load_model_from_db <- function(aid) {
+  model_blob <- dbGetQuery(con, "SELECT model FROM models WHERE aid = ?", params = list(aid))
+  
+  if (nrow(model_blob) == 0) {
+    return(NULL)  # No model found for this AID
+  }
+  
+  unserialized_model <- unserialize(model_blob$model[[1]])
+  return(unserialized_model)
+}
+
+# Close the database connection when the app is stopped
+onStop(function() {
+  dbDisconnect(con)
+})
+
+plan(multisession)
 
 ui <- fluidPage(
   
@@ -38,7 +79,7 @@ ui <- fluidPage(
       HTML('<br>'),
       
       fileInput(inputId = 'unknowns_in', label = 'Upload Unknowns in SDF Format', placeholder = "repurposing.sdf"),
-      actionButton('unknowns_pred', 'Test Unknowns', style = 'background-color:blue; font-weight:bold; color:white'),
+      actionButton('unknowns_pred', 'Test Unknowns', style = 'background-color:green; font-weight:bold; color:white'),
 
       downloadButton('downloadData', 'Download Predictions')
       
@@ -99,82 +140,71 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   
-  rv <- reactiveValues(index = NULL,
-                       data_loaded = FALSE,
-                       assay_data = NULL,
-                       training_data = NULL,
-                       fit = NULL)
+  rv <- reactiveValues(index = NULL, data_loaded = FALSE, assay_data = NULL, training_data = NULL, fit = NULL)
   
-  
-  shinyjs::onclick("toggleAdvanced",
-                   shinyjs::toggle(id = "advanced", anim = TRUE))   
-  
+  shinyjs::onclick("toggleAdvanced", shinyjs::toggle(id = "advanced", anim = TRUE))
   
   retrieve_data <- reactive({
     req(input$aid)
-
-    
     assay_data <- tryCatch({
       rpubchem::get.assay(as.numeric(input$aid)) %>%
         dplyr::filter(!is.na(PUBCHEM.CID))
     }, error = function(e) {
-      showNotification("Failed to retrieve assay data. Please check the target AID.", type = "error")
+      shinyalert::shinyalert("Error", "Failed to retrieve assay data. Please check the target AID.", type = "error")
       return(NULL)
     })
-    
     return(assay_data)
   }) %>% debounce(1000)
+  
+  
+  observeEvent(input$aid, {
+    aid <- input$aid
+    
+    # Load the model from the database if it exists
+    model <- load_model_from_db(aid)
+    
+    if (!is.null(model)) {
+      rv$fit <- model
+      showNotification("Loaded pre-trained model for AID: ", type = "message")
+    } else {
+      rv$fit <- NULL
+      showNotification("No pre-trained model found for AID. Please train the model.", type = "error")
+    }
+  })
   
   observeEvent(input$load_data, {
     req(retrieve_data())
     
     showNotification("Loading data and generating fingerprints...", type = "message", duration = NULL)
-
     
-    tryCatch({
+    future({
       assay_data <- isolate(retrieve_data())
-      
-      cl <- parallel::makeCluster(parallel::detectCores() - 1)
-      doParallel::registerDoParallel(cl)
-      
-      # Check if 'PUBCHEM.EXT.DATASOURCE.SMILES' column exists
       if ('PUBCHEM.EXT.DATASOURCE.SMILES' %in% colnames(assay_data)) {
-        # Use SMILES strings from the assay data
         mol <- rcdk::parse.smiles(assay_data$PUBCHEM.EXT.DATASOURCE.SMILES)
       } else {
-        # Retrieve SMILES using CIDs
         cids <- map(seq(ceiling(length(assay_data$PUBCHEM.CID) / 500)), 
-                    ~str_c(
-                      assay_data$PUBCHEM.CID[((.x - 1) * 500 + 1):ifelse(length(assay_data$PUBCHEM.CID) > (.x * 500), (.x * 500), length(assay_data$PUBCHEM.CID))], 
-                      collapse = ","))
-        
+                    ~str_c(assay_data$PUBCHEM.CID[((.x - 1) * 500 + 1):min(.x * 500, length(assay_data$PUBCHEM.CID))], 
+                           collapse = ","))
         url <- map(cids, ~paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/", .x, "/property/canonicalsmiles/csv"))
         smiles <- unlist(map(url, ~read_csv(httr::content(httr::GET(.x), "text", encoding = "UTF-8"))$CanonicalSMILES))
-        
         mol <- rcdk::parse.smiles(as.vector(smiles))
       }
-
-      # Generate molecular descriptors (e.g., Rule of 5)
       descriptors <- do.call(cbind, map(
         c('extractDrugExtendedComplete', 'extractDrugApol', 'extractDrugTPSA', 'extractDrugHBondAcceptorCount', 
           'extractDrugHBondDonorCount', 'extractDrugWeight', 'extractDrugXLogP'), 
         function(f) eval(parse(text = paste0('Rcpi::', f, '(mol)'))))) %>%
         data.frame() %>%
-        set_names(str_replace(colnames(.), "(X)(\\d)", "ECFP\\2"))
-      
-      parallel::stopCluster(cl)
-      
-      # Combine fingerprints and descriptors into a single dataset
-      rv$training_data <- data.frame(cbind(PUBCHEM.ACTIVITY.OUTCOME = as.factor(assay_data$PUBCHEM.ACTIVITY.OUTCOME), descriptors)) 
+        set_names(str_replace(colnames(.), "(X)(\\d)", "ECFP\\2")) 
+      return(data.frame(cbind(PUBCHEM.ACTIVITY.OUTCOME = as.factor(assay_data$PUBCHEM.ACTIVITY.OUTCOME), descriptors)))
+    }) %...>% {
+      rv$training_data <- .
       rv$data_loaded <- TRUE
-
       showNotification("Data and fingerprints loaded successfully!", type = "message")
-      
-    }, error = function(e) {
-      showNotification("Error loading data or generating fingerprints. Please try again.", type = "error")
-    })
+    } %...!% {
+      shinyalert::shinyalert("Error", "Failed to load data or generate fingerprints.", type = "error")
+    }
   })
-  # Function to generate training data from molecular structures using rcdk
+        
 
   
   # Preprocess the training data
@@ -194,6 +224,7 @@ server <- function(input, output, session) {
     } else {
       data <- data  # No sampling applied
     }
+    
     
     
     if (input$remove_zeroVar) {
@@ -265,72 +296,71 @@ server <- function(input, output, session) {
   observeEvent(input$train, {
     req(preprocess_data())
     processed_data <- preprocess_data()
+    
+    # Capture reactive inputs before starting future
+    folds <- input$folds
+    tuneLength <- input$tuneLength
+    aid <- input$aid
+    
 
-    withProgress(message = 'Training model...', value = 0, {
-
-      incProgress(0.3)  # Update progress bar
-      
-      index = rv$index
-      # Data partitioning
-      train <- processed_data[index, ]
-      test <- processed_data[-index, ]
-      assay_data <- retrieve_data()
-      
-      cl <- parallel::makeCluster(parallel::detectCores() - 1)
-      doParallel::registerDoParallel(cl)
-      
+    index <- caret::createDataPartition(processed_data$PUBCHEM.ACTIVITY.OUTCOME, p = 0.75, list = FALSE)
+    rv$index <- index
+    train <- processed_data[index, ]
+    test <- processed_data[-index, ]
+    
+    # Asynchronously train the model using future
+    future({
       tryCatch({
+        ctrl <- caret::trainControl(method = 'repeatedcv', 
+                                    number = folds,  # Use the captured value
+                                    repeats = 3, 
+                                    classProbs = TRUE, 
+                                    savePredictions = 'all')
         
-        ctrl <- caret::trainControl(
-          method = 'repeatedcv', 
-          number = input$folds, 
-          repeats = 3, 
-          classProbs = TRUE,
-          savePredictions = 'all')
-        
-        fit <- caret::train(PUBCHEM.ACTIVITY.OUTCOME ~ .,
-                            data = train,
-                            method = 'rf', 
+        fit <- caret::train(PUBCHEM.ACTIVITY.OUTCOME ~ ., 
+                            data = train, 
+                            method = 'rf',
                             trControl = ctrl, 
-                            na.action = na.omit,
-                            tuneLength = input$tuneLength, 
+                            tuneLength = tuneLength,  # Use the captured value
                             metric = 'Accuracy')
         
-        incProgress(0.6)  # Update progress bar
         
-        output$summary <- DT::renderDT({
-          DT::datatable(fit$results, extensions = 'Buttons', filter = 'top', options = list(dom = 'Bfrtlp', buttons = c('copy', 'csv', 'excel')))
-        })
-        
-        output$roc <- renderPlot({
-          plot(fit, type = 'b')
-        })
-        
-        importance <- caret::varImp(fit)
-        output$imp_out <- renderPlot({
-          plot(importance, top = 20)
-        })
-        
-        probs <- predict(fit, test, type = 'prob') %>%
-          set_names(paste("Probs", colnames(.)))
-        
-        pred <- cbind(assay_data[-index, sapply(assay_data, is.character)], probs)
-        
-        output$prediction <- DT::renderDT({
-          DT::datatable(pred, extensions = 'Buttons', options = list(dom = 'Bfrtlp', buttons = c('copy', 'csv', 'excel')))
-        })
-        
-        rv$fit <- fit
-        
-        incProgress(1)  # Complete progress
-      }, finally = {
-        parallel::stopCluster(cl)
+        fit  # Return the model
+      }, error = function(e) {
+        message("Error during model training: ", e$message)
+        stop(e)  # Re-throw the error to the outer handler
       })
+    }, seed = TRUE) %...>% {
+      # Handle the successful result (when the future is resolved)
+      rv$fit <- .
+      save_model_to_db(., aid)
+      
+      output$summary <- DT::renderDT({
+        DT::datatable(rv$fit$results, 
+                  extensions = 'Buttons', 
+                  options = list(
+                    dom = 'Bfrtip', 
+                    buttons = c('copy', 'csv', 'excel'),
+                    serverSide = TRUE  # Enable server-side processing
+                  ))
+      }, server = TRUE)
+      output$roc <- renderPlot({
+        plot(rv$fit, type = 'b')
+      })
+      importance <- caret::varImp(rv$fit)
+      output$imp_out <- renderPlot({
+        plot(importance, top = 20)
+      })
+      showNotification("Model training completed successfully!", type = "message")
+    } %...!% {
+      # Handle the error case (when the future encounters an error)
+      showNotification("Failed to train the model.", type = "error")
+    } %>% finally(function() {
+      # Ensure progress is completed
     })
+  
   })
   
-
-
   
   output$downloadData <- downloadHandler(
     filename = function() {
@@ -377,6 +407,8 @@ server <- function(input, output, session) {
         data.frame() %>%
         set_names(str_replace(colnames(.), "(X)(\\d)", "ECFP\\2"))
       
+      row.names(unknown_data) <- unlist(map(mol, ~rcdk::get.property(.x, 'smiles')))
+
       unknown_data <- dplyr::select(unknown_data, any_of(colnames(preprocessed)))
       
       if (exists("rv$preProc")) {
@@ -384,8 +416,9 @@ server <- function(input, output, session) {
         unknown_data <- predict(preProc, unknown_data)
       }
       
-      predictions <- predict(fit, unknown_data, type = "prob") %>%
-        print()
+      predictions <- predict(fit, unknown_data, type = "prob") 
+      
+      row.names(predictions) <- row.names(unknown_data)
 
       output$unknowns_out <- DT::renderDT({
         DT::datatable(predictions, extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel')))
