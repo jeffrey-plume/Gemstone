@@ -5,8 +5,21 @@ library(tidyverse)
 library(future)
 library(DBI)
 library(RSQLite)
-library(future)
 library(promises)
+library(rpubchem)
+library(rcdk)
+library(doParallel)
+library(caret)
+library(ROSE)
+library(shinybusy)
+library(shinyjs)
+library(shinyalert)
+
+# Parallel setup
+n_cores <- max(1, parallel::detectCores() - 1)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
 
 # Create a SQLite database connection
 con <- dbConnect(RSQLite::SQLite(), "models.db")
@@ -54,7 +67,7 @@ ui <- fluidPage(
     sidebarPanel(
       
       numericInput(inputId = 'aid', label = 'Target Assay ID', value = 1190),
-      
+      fileInput(inputId = 'unknowns_in', label = 'Upload Molecules in SDF Format (Optional)'),
       actionButton('load_data', 'Load Descriptors & Fingerprints', style = 'background-color:green; font-weight:bold; color:white'),
       
       # Preprocessing controls
@@ -173,37 +186,62 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$load_data, {
-    req(retrieve_data())
+    # Capture all needed reactive inputs *before* the future starts
+    unknown_file <- if (!is.null(input$unknowns_in)) input$unknowns_in$datapath else NULL
+    aid_val <- input$aid
     
     showNotification("Loading data and generating fingerprints...", type = "message", duration = NULL)
     
     future({
-      assay_data <- isolate(retrieve_data())
-      if ('PUBCHEM.EXT.DATASOURCE.SMILES' %in% colnames(assay_data)) {
-        mol <- rcdk::parse.smiles(assay_data$PUBCHEM.EXT.DATASOURCE.SMILES)
-      } else {
-        cids <- map(seq(ceiling(length(assay_data$PUBCHEM.CID) / 500)), 
-                    ~str_c(assay_data$PUBCHEM.CID[((.x - 1) * 500 + 1):min(.x * 500, length(assay_data$PUBCHEM.CID))], 
-                           collapse = ","))
-        url <- map(cids, ~paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/", .x, "/property/canonicalsmiles/csv"))
-        smiles <- unlist(map(url, ~read_csv(httr::content(httr::GET(.x), "text", encoding = "UTF-8"))$CanonicalSMILES))
-        mol <- rcdk::parse.smiles(as.vector(smiles))
-      }
-      descriptors <- do.call(cbind, map(
-        c('extractDrugExtendedComplete', 'extractDrugApol', 'extractDrugTPSA', 'extractDrugHBondAcceptorCount', 
-          'extractDrugHBondDonorCount', 'extractDrugWeight', 'extractDrugXLogP'), 
-        function(f) eval(parse(text = paste0('Rcpi::', f, '(mol)'))))) %>%
-        data.frame() %>%
-        set_names(str_replace(colnames(.), "(X)(\\d)", "ECFP\\2")) 
-      return(data.frame(cbind(PUBCHEM.ACTIVITY.OUTCOME = as.factor(assay_data$PUBCHEM.ACTIVITY.OUTCOME), descriptors)))
+      tryCatch({
+        if (!is.null(unknown_file)) {
+          message("Attempting to load SDF file: ", unknown_file)
+          mol <- rcdk::load.molecules(unknown_file)
+          assay_data <- tibble(PUBCHEM.ACTIVITY.OUTCOME = factor("Unknown", levels = c("Active", "Inactive")))
+        } else {
+          message("Fetching assay data from PubChem for AID: ", aid_val)
+          assay_data <- rpubchem::get.assay(as.numeric(aid_val)) %>%
+            dplyr::filter(!is.na(PUBCHEM.CID))
+          
+          if ('PUBCHEM.EXT.DATASOURCE.SMILES' %in% colnames(assay_data)) {
+            mol <- rcdk::parse.smiles(assay_data$PUBCHEM.EXT.DATASOURCE.SMILES)
+          } else {
+            cids <- map(seq(ceiling(length(assay_data$PUBCHEM.CID) / 500)), 
+                        ~str_c(assay_data$PUBCHEM.CID[((.x - 1) * 500 + 1):min(.x * 500, length(assay_data$PUBCHEM.CID))], collapse = ","))
+            url <- map(cids, ~paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/", .x, "/property/canonicalsmiles/csv"))
+            smiles <- unlist(map(url, ~read_csv(httr::content(httr::GET(.x), "text", encoding = "UTF-8"))$CanonicalSMILES))
+            mol <- rcdk::parse.smiles(as.vector(smiles))
+          }
+        }
+        
+        message("Generating descriptors...")
+        descriptors <- do.call(cbind, map(
+          c('extractDrugExtendedComplete', 'extractDrugApol', 'extractDrugTPSA', 'extractDrugHBondAcceptorCount', 
+            'extractDrugHBondDonorCount', 'extractDrugWeight', 'extractDrugXLogP'), 
+          function(f) {
+            message("Running: ", f)
+            eval(parse(text = paste0('Rcpi::', f, '(mol)')))
+          })) %>%
+          data.frame() %>%
+          set_names(str_replace(colnames(.), "(X)(\\d)", "ECFP\\2"))
+        
+        message("Data loaded and descriptors generated.")
+        data.frame(cbind(PUBCHEM.ACTIVITY.OUTCOME = as.factor(assay_data$PUBCHEM.ACTIVITY.OUTCOME), descriptors))
+        
+      }, error = function(e) {
+        message("ERROR in load_data: ", e$message)
+        traceback()
+        stop(e)
+      })
     }) %...>% {
       rv$training_data <- .
       rv$data_loaded <- TRUE
       showNotification("Data and fingerprints loaded successfully!", type = "message")
     } %...!% {
-      shinyalert::shinyalert("Error", "Failed to load data or generate fingerprints.", type = "error")
+      showNotification("Failed to load data or generate fingerprints. See console for details.", type = "error")
     }
   })
+  
         
 
   
@@ -276,7 +314,11 @@ server <- function(input, output, session) {
     Sys.sleep(1)
     
     description <- tryCatch({
-      rpubchem::get.assay.desc(input$aid)
+      #rpubchem::get.assay.desc(input$aid)
+      url <- paste0("https://pubchem.ncbi.nlm.nih.gov/rest/pug/assay/aid/", input$aid, "/CSV")
+      df <- read.csv(url)
+      df <- df %>% filter(!is.na(PUBCHEM_CID))
+      return(df)
     }, error = function(e) {
       showNotification("Failed to retrieve assay description. Please check the target AID.", type = "error")
       return(NULL)
@@ -378,11 +420,8 @@ server <- function(input, output, session) {
   
   output$prop <- DT::renderDT({
     req(preprocess_data())
-    
-    
     DT::datatable(preprocess_data())
-  },
-  server = FALSE)
+  }, server = TRUE)
 
 
     
@@ -431,8 +470,12 @@ server <- function(input, output, session) {
     })
   })
   
+  # Clean up
+  onStop(function() {
+    stopCluster(cl)
+    dbDisconnect(con)
+  })
 }
-
 # Run the application 
 shinyApp(ui = ui, server = server)
 
